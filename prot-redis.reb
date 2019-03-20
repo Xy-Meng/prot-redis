@@ -5,49 +5,6 @@ REBOL [
 	Created: 30-3-2013
     Version: 0.3.2
     Author: "Boleslav Březovský"
-;    Checksum: #{FB5370E73C55EF3C16FB73342E6F7ACFF98EFE97}
-	To-Do: [
-		{Sharding:
-* need to setup nodes - must define with some function (SET-REDIS-NODES
-	or something like that)
-	SET-REDIS-NODES [localhost]						; one node on default port
-	SET-REDIS-NODES [localhost:7000]				; one node on selected port
-	SET-REDIS-NODES [localhost:7000 localhost:7001] ; two nodes on selected ports
-	SET-REDIS-NODES [localhost 7000 .. 7009]		; ten nodes from first to last port
-	SET-REDIS-NODES [192.168.1.100 192.168.1.110]	; two nodes on default ports
-	SET-REDIS-NODES [192.168.1.100:7000 192.168.1.110:8000] ; two nodes on selected ports
-	SET-REDIS-NODES [192.168.1.100 7000 .. 7009 192.168.1.200 7000 .. 7009 ] ; twenty nodes on two ranges
-	etc ...
-
-	SET-REDIS-NODES/APPEND - add new node to existing pool
-	SET-REDIS-NODES/REMOVE - remove node from existing pool
-
-* when there's more than one Redis node, the protocol will shard keys -
-	split them to different nodes. Basic sharding is done this way:
-
-	redis-node: checksum/hash to binary! key length? redis-nodes
-
-	this function can be replaced with custom one.
-		}
-	]
-	Notes: [
-{
-Dialect description: 
-	GET-WORD! get value of word     >> x: 1 [:x]               == [1]
-	GET-PATH! get value of path     >> a: object [b: 1] [:a/b] == [2]
-	PAREN!    evaluate code         >> [(x + a/b)]             == [3]
-	BLOCK!    convert to redis key  >> [['x x]]                == ["x:1"]
-}
-	]
-	Bugs: [
-{
->> user-key: first [vske/user/1]         
-== vske/user/1
-
->> send-redis rp [HGET :user-key 'name] 
-** Access error: protocol error: "ERR wrong number of arguments for 'hget' command"
-}
-	]
 	Type: 'module
 	Name: 'prot-redis
 	Exports: [send-redis write-key read-key]
@@ -57,6 +14,8 @@ comment {File redis.r3 created by PROM on 30-Mar-2013/8:55:56+1:00}
 
 debug: none
 ;debug: :print
+
+single?: func [block][1 = length? block]
 
 flat-body-of: funct [
 	"Change all set-words to words"
@@ -109,7 +68,7 @@ make-bulk: func [
 	data: switch/default type?/word data [
 		binary!		[ data ]
 	][ to binary! form data ]
-	repend out [
+	repend out [	
 		"$" to string! length? data crlf
 		data crlf
 	]
@@ -143,6 +102,7 @@ parse-reply: func [
 		message length status error integer bulk multi
 		msg ret out
 ] [
+
 	out: ret: make block! min 1000 system/schemes/redis/spec/pipeline-limit
 	message: [
 		copy msg to crlf (unless binary [msg: to string! msg])
@@ -276,7 +236,7 @@ parse-server-info: funct [
 	obj
 ]
 
-redis-type?: funct [
+redis-type?: func [
 	"Get Redis datatype of a key"
 	redis-port [port!]
 	/key name "Name of key"
@@ -332,50 +292,23 @@ parse-dialect: funct [
 	body
 ]
 
-;===AWAKE HANDLER
-
-awake-handler: funct [
-	event
-	/local port
-][
-;	print ["Awake-event:" event/type]
-	port: event/port
-	switch/default event/type [
-		lookup [
-			open port
-		]
-		connect [
-			write port take/part port/locals 32'000
-		]
-		wrote [
-			; DONE in loop to prevent problem described in CC #2160
-			either empty? port/locals [
-				read port
-			] [
-				write port take/part port/locals 32'000
+emit: func [
+		evt-port [port!]
+		evt-type [word!]
+		/data payload
+	][
+		if data [
+			 either block? evt-port/data [
+				append evt-port/data payload
+			][
+				evt-port/data: reduce [payload]
 			]
 		]
-		read  [
-			local: port/data
-			append port/spec/redis-data take/part local length? local
-			either validate-reply port/spec/redis-data [
-				return true	
-			] [
-				read port
-			]
+		append system/ports/system make event! [
+			type: evt-type
+			port: evt-port
 		]
-		close [
-			return true
-		]
-	] [
-		print ["Unexpected event:" event/type]
-		close port
-		return true
 	]
-	false ; returned
-]
-
-	; TODO: support more callbacks, add remove callback, list callbacks
 
 
 set-callback: func [
@@ -419,6 +352,7 @@ write-key: funct [
 		key: first key
 	]
 	type: redis-type?/key redis-port key
+	print []
 	cmd: compose reduce/only case [
 		all [equal? type 'none block? value]			[ [RPUSH key (value)] ]
 		all [
@@ -434,7 +368,10 @@ write-key: funct [
 		equal? type 'set								[ [SADD key value] ]
 		all [equal? type 'zset member]					[ [ZADD key value member] ]
 	] redis-commands
+
+	;print ["cmd: " to string! cmd]
 	write redis-port cmd
+	
 ]
 
 read-key: funct [
@@ -502,31 +439,97 @@ sys/make-scheme [
 
 		open: func [
 			redis-port [port!]
-			/local tcp-port
 		][
-			if redis-port/state [return redis-port]
-			if none? redis-port/spec/host [make-redis-error "Missing host address"]
-			redis-port/state: context [
-				tcp-port:			none
-				pipeline-length:	0
-				key: if redis-port/spec/path [load next redis-port/spec/path]
-				index:				none
+			redis-port/state: make object! [
+				pipeline-length: 1
+				tcp-port: open make port! [
+					scheme: 'tcp
+					host: redis-port/spec/host
+					port-id: redis-port/spec/port-id
+					timeout: redis-port/spec/timeout
+					ref: rejoin [tcp:// host ":" port-id]
+					port-state: 'init
+					redis-data: none
+					awake: func [ 
+						event [event!] 
+						/local pl
+						][
+							pl: event/port/locals
+							print ["Awake-event:" event/type "state: " pl/state]
+							switch/default event/type [
+								lookup [
+									open event/port
+								]
+								connect [
+									write event/port {*2^M^/$4^M^/AUTH^M^/$7^M^/atronix^M^/}
+									;print {*2^M^/$4^M^/AUTH^M^/$7^M^/atronix^M^/}
+									pl/state: 'connection-initiated
+									;write port take/part port/locals 32'000
+								]
+								wrote [
+									switch/default pl/state [
+										connection-initiated [
+											read event/port
+											pl/state: 'waiting-for-connection-ack
+										]
+										connected [
+											either empty? /locals [
+												read event/port
+											][
+												write event/port take/part pl 32'000
+												;emit pl/redis-port 
+											]
+										]
+									][
+										print ["unknow state: " pl/state]
+									]		
+								]
+								read [
+									local: event/port/data
+									append event/port/spec/redis-data take/part local length? local
+									print ["redis-data: " event/port/spec/redis-data]
+									either validate-reply event/port/spec/redis-data [
+										switch/default pl/state [
+											waiting-for-connection-ack [											
+												state: 'connected	
+												return true
+											]
+											connected [
+												read event/port
+											]
+										][read event/port]
+									
+									][
+										read event/port
+									]
+								]		
+								close [
+									return true
+								]
+								error [
+									
+								]
+							] [
+								print ["Unexpected event:" event/type]
+								close pl
+								return true
+							]
+						false ; returned
+					]
+				]
 			]
-			redis-port/state/tcp-port: tcp-port: make port! [
-				scheme: 'tcp
-				host: redis-port/spec/host
-				port-id: redis-port/spec/port-id
-				timeout: redis-port/spec/timeout
-				ref: rejoin [tcp:// host ":" port-id]
-				port-state: 'init
-				redis-data: none
-				locals: make binary! 10000
-				callback: :redis-port/spec/callback
+
+			redis-port/state/tcp-port/locals: make object! [
+					state: 'init
+					redis-port: redis-port
+					buf: #{}
+					store: make binary! 10000
 			]
-			tcp-port/awake: :awake-handler ;:redis-port/awake ;none
-			open tcp-port
 			redis-port
-		]
+		]	
+			
+			
+		
 
 		close: func [
 			redis-port [port!]
@@ -555,8 +558,9 @@ sys/make-scheme [
 			tcp-port: redis-port/state/tcp-port
 			tcp-port/spec/redis-data: make binary! 32'000
 			wait [tcp-port redis-port/spec/timeout]
-			clear tcp-port/locals
+			clear tcp-port/locals/store
 			redis-port/state/pipeline-length: 0
+			print ["redis-data: " mold to string! tcp-port/spec/redis-data]
 			also tcp-port/spec/redis-data close redis-port
 		]
 
@@ -572,12 +576,18 @@ sys/make-scheme [
 			]
 			redis-port/spec/path: none
 			tcp-port: redis-port/state/tcp-port
-			if none? tcp-port/locals [
+			if none? tcp-port/locals/store [
 				; Init pipeline buffer (100 bytes for each command in automatic or basic mode, 1 000 000 bytes for manual mode
 				size: either zero? redis-port/spec/pipeline-limit [1'000'000][100 * redis-port/spec/pipeline-limit]
-				tcp-port/locals: make binary! size
+				tcp-port/locals/store: make binary! size
 			]
-			append tcp-port/locals make-bulk-request parse-dialect data
+			
+			print ["tcp-port/locals before: " mold to string! tcp-port/locals/store]
+			append tcp-port/locals/store make-bulk-request  parse-dialect data 
+			print ["make-bulk-request parse-dialect data: " mold to string! make-bulk-request parse-dialect data]
+			print [ "parse-dialect data: " mold to string! parse-dialect data]
+			print ["tcp-port/locals: " mold to string! tcp-port/locals/store]
+			
 			redis-port/state/pipeline-length: redis-port/state/pipeline-length + 1
 			case [
 				zero? redis-port/spec/pipeline-limit [
@@ -588,12 +598,14 @@ sys/make-scheme [
 					1 = redis-port/spec/pipeline-limit
 				][
 					redis-port/spec/force-cmd?: false
+					print "breakpoint1"
 					read redis-port
+				
 				]
 				true [
 					either redis-port/state/pipeline-length = redis-port/spec/pipeline-limit [
-;						print mold to string! tcp-port/locals
-;						print "now reading from server"
+						;print mold to string! tcp-port/locals/store
+						print "now reading from server"
 						read redis-port
 					] [
 						redis-port/state/pipeline-length
@@ -683,3 +695,4 @@ sys/make-scheme [
 		]
 	]
 ]
+
