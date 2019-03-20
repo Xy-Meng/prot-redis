@@ -241,6 +241,7 @@ redis-type?: func [
 	redis-port [port!]
 	/key name "Name of key"
 ][
+	print ["redis-port/spec/path: " mold redis-port/spec/path]
 	unless key [name: get-key redis-port ]
 	if name [
 		to lit-word! parse-reply write redis-port [ TYPE :name ]
@@ -265,11 +266,11 @@ process-pipeline: func [
 ][
 	tcp-port: redis-port/state/tcp-port
 	wait [tcp-port redis-port/spec/timeout]
-	clear tcp-port/locals
+	clear tcp-port/locals/store
 	tcp-port/spec/redis-data
 ]
 
-parse-dialect: funct [
+parse-dialect: func [
 	"Get value of get-word! and get-path!, evaluate paren! and process KEY blocks"
 	dialect [block!]
 	/local body key
@@ -293,22 +294,23 @@ parse-dialect: funct [
 ]
 
 emit: func [
-		evt-port [port!]
-		evt-type [word!]
-		/data payload
-	][
-		if data [
-			 either block? evt-port/data [
-				append evt-port/data payload
-			][
-				evt-port/data: reduce [payload]
-			]
-		]
-		append system/ports/system make event! [
-			type: evt-type
-			port: evt-port
+	evt-port [port!]
+	evt-type [word!]
+	/data payload
+][
+	if data [
+			either block? evt-port/data [
+			append evt-port/data payload
+		][
+			evt-port/data: reduce [payload]
 		]
 	]
+	append system/ports/system make event! [
+		type: evt-type
+		port: evt-port
+	]
+]
+
 
 
 set-callback: func [
@@ -342,7 +344,7 @@ redis-commands: [
 	zremrangebyscore zrevrange zrevrangebyscore zrevrank zscore zunionstore
 ]
 
-write-key: funct [
+write-key: func [
 	redis-port	[port!]
 	key
 	value
@@ -352,7 +354,7 @@ write-key: funct [
 		key: first key
 	]
 	type: redis-type?/key redis-port key
-	print []
+	print ["type: " mold type]
 	cmd: compose reduce/only case [
 		all [equal? type 'none block? value]			[ [RPUSH key (value)] ]
 		all [
@@ -369,7 +371,7 @@ write-key: funct [
 		all [equal? type 'zset member]					[ [ZADD key value member] ]
 	] redis-commands
 
-	;print ["cmd: " to string! cmd]
+	print ["cmd: " to string! mold cmd]
 	write redis-port cmd
 	
 ]
@@ -441,7 +443,10 @@ sys/make-scheme [
 			redis-port [port!]
 		][
 			redis-port/state: make object! [
-				pipeline-length: 1
+				pipeline-length: 0
+				key: if redis-port/spec/path [load next redis-port/spec/path]
+				;print ["redis-port/spec/path: " mold redis-port/spec/path]
+				index: none
 				tcp-port: open make port! [
 					scheme: 'tcp
 					host: redis-port/spec/host
@@ -473,10 +478,10 @@ sys/make-scheme [
 											pl/state: 'waiting-for-connection-ack
 										]
 										connected [
-											either empty? /locals [
+											either empty? pl/store [
 												read event/port
 											][
-												write event/port take/part pl 32'000
+												write event/port take/part pl/store 32'000
 												;emit pl/redis-port 
 											]
 										]
@@ -582,11 +587,11 @@ sys/make-scheme [
 				tcp-port/locals/store: make binary! size
 			]
 			
-			print ["tcp-port/locals before: " mold to string! tcp-port/locals/store]
+			print ["tcp-port/locals/store before: " mold to string! tcp-port/locals/store]
 			append tcp-port/locals/store make-bulk-request  parse-dialect data 
 			print ["make-bulk-request parse-dialect data: " mold to string! make-bulk-request parse-dialect data]
 			print [ "parse-dialect data: " mold to string! parse-dialect data]
-			print ["tcp-port/locals: " mold to string! tcp-port/locals/store]
+			print ["tcp-port/locals/store: " mold to string! tcp-port/locals/store]
 			
 			redis-port/state/pipeline-length: redis-port/state/pipeline-length + 1
 			case [
